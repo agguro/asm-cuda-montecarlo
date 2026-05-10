@@ -1,5 +1,3 @@
-# README.md
-
 # ASM CUDA Monte Carlo Engine
 
 Bare-metal Monte Carlo simulation engine implemented with:
