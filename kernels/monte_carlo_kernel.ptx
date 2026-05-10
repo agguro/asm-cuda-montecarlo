@@ -1,0 +1,195 @@
+/*
+ * ============================================================================
+ * GPU KERNEL: BARE-METAL GEOMETRIC BROWNIAN MOTION (GBM)
+ * ============================================================================
+ * Author: agguro & gemini AI to do the heavy typing
+ * Monte Carlo Engine (Optimized for NVIDIA sm_61+)
+ * 
+ * MATHEMATICAL MODEL:
+ * The future price S(t) follows the stochastic differential equation:
+ *    dS = μSdt + σSdW
+ * Integrated Solution:
+ *    S(t) = S(0) * exp( (μ - 0.5 * σ²) * t + σ * Z * sqrt(t) )
+ *
+ * MAPPING TO PTX:
+ * - Entropy: Xorshift64* algorithm
+ * - Normal Distribution: Box-Muller Transform
+ * - Exp/Log: Base-2 Hardware Intrinsics (ex2.approx / lg2.approx)
+ * ============================================================================
+ */
+
+.version 7.0
+.target sm_61
+.address_size 64
+
+.visible .entry monte_carlo_kernel (
+    .param .u64 input_ptr,      // Pointer to input data (not used in forecast mode)
+    .param .u64 out_sums_ptr,   // VRAM: Cumulative final prices per thread (double[])
+    .param .u64 out_hits_ptr,   // VRAM: Cumulative target hits per thread (uint32[])
+    .param .f64 drift,          // mu: Daily average return
+    .param .f64 volatility,     // sigma: Daily standard deviation
+    .param .f64 target_price,   // User-defined target price
+    .param .f64 start_price,    // S0: Latest known price (The Launchpad)
+    .param .u64 seed,           // Global seed for randomness
+    .param .u64 iters,          // Number of simulation paths per thread
+    .param .u64 total_records,  // Metadata: Total count in ticker file
+    .param .u64 horizon         // Number of days to simulate into the future
+)
+{
+    // --- REGISTER DEFINITIONS ---
+
+    .reg .b32   %r_tid, %r_ctaid, %r_ntid, %r_sim_cnt, %r_day_cnt, %r_iters, %r_horizon, %r_hit_flag, %r_total_hits;
+    .reg .b64   %rd_state, %rd_tmp, %rd_off, %rd_sums_ptr, %rd_hits_ptr;
+    .reg .f64   %fd_sum_acc, %fd_S0, %fd_target, %fd_drift, %fd_vol, %fd_St;
+    .reg .f64   %fd_drift_term, %fd_u1, %fd_u2, %fd_z, %fd_temp, %fd_const_pi;
+    .reg .f32   %f_u1, %f_u2, %f_z, %f_temp;
+    .reg .pred  %p_sim_loop, %p_path_loop, %p_is_hit, %p_target_below, %p_hit_now;
+
+    // 1. INITIAL PARAMETER LOADING
+
+    ld.param.f64 %fd_S0, [start_price];
+    ld.param.f64 %fd_vol, [volatility];
+    ld.param.f64 %fd_target, [target_price];
+    ld.param.f64 %fd_drift, [drift];
+    ld.param.u64 %rd_tmp, [iters];           cvt.u32.u64 %r_iters, %rd_tmp;
+    ld.param.u64 %rd_tmp, [horizon];         cvt.u32.u64 %r_horizon, %rd_tmp;
+
+    // 2. GRID/THREAD IDENTIFICATION
+    // Global ID = threadIdx.x + (blockIdx.x * blockDim.x)
+
+    mov.u32 %r_tid, %tid.x;
+    mov.u32 %r_ctaid, %ctaid.x;
+    mov.u32 %r_ntid, %ntid.x;
+    mad.lo.u32 %r_tid, %r_ctaid, %r_ntid, %r_tid;
+
+    // 3. DRIFT TERM PRE-CALCULATION
+    // Formula: DriftTerm = μ - (0.5 * σ²)
+
+    mul.f64 %fd_temp, %fd_vol, %fd_vol;
+    fma.rn.f64 %fd_drift_term, %fd_temp, -0.5, %fd_drift;
+
+    // 4. RNG SEEDING
+    // seed = input_seed + global_thread_id
+
+    ld.param.u64 %rd_state, [seed];
+    cvt.u64.u32 %rd_off, %r_tid;
+    add.u64 %rd_state, %rd_state, %rd_off;
+    or.b64 %rd_state, %rd_state, 1; // Ensure state is never 0
+
+    // Reset thread-local accumulators
+
+    mov.f64 %fd_sum_acc, 0.0;
+    mov.u32 %r_total_hits, 0;
+    mov.u32 %r_sim_cnt, 0;
+
+L_SIM_LOOP:
+
+    // --- START OF NEW PATH ---
+
+    mov.f64 %fd_St, %fd_S0;        // Start at current price
+    mov.u32 %r_day_cnt, 0;
+    mov.u32 %r_hit_flag, 0;        // Path-specific hit flag (binary 0 or 1)
+
+L_PATH_WALK:
+
+    // 5. ENTROPY GENERATION (U1 & U2)
+    // Formula: Xorshift64* algorithm
+    // 64-bit state shift/xor sequence
+
+    shl.b64 %rd_off, %rd_state, 13; xor.b64 %rd_state, %rd_state, %rd_off;
+    shr.u64 %rd_off, %rd_state, 7;  xor.b64 %rd_state, %rd_state, %rd_off;
+    shl.b64 %rd_off, %rd_state, 17; xor.b64 %rd_state, %rd_state, %rd_off;
+    
+    // IEEE-754 Bit Hacking: Construct float in range [1.0, 2.0) and subtract 1.0
+    // Result: U ~ Uniform(0, 1)
+
+    and.b64 %rd_off, %rd_state, 0xFFFFFFFFFFFFF;
+    or.b64  %rd_off, %rd_off, 0x3FF0000000000000;
+    mov.b64 %fd_u1, %rd_off;
+    sub.f64 %fd_u1, %fd_u1, 1.0; 
+
+    // Repeat for U2
+    shl.b64 %rd_off, %rd_state, 13; xor.b64 %rd_state, %rd_state, %rd_off;
+    shr.u64 %rd_off, %rd_state, 7;  xor.b64 %rd_state, %rd_state, %rd_off;
+    shl.b64 %rd_off, %rd_state, 17; xor.b64 %rd_state, %rd_state, %rd_off;
+    and.b64 %rd_off, %rd_state, 0xFFFFFFFFFFFFF;
+    or.b64  %rd_off, %rd_off, 0x3FF0000000000000;
+    mov.b64 %fd_u2, %rd_off;
+    sub.f64 %fd_u2, %fd_u2, 1.0;
+    max.f64 %fd_u1, %fd_u1, 1.0e-15; // Stability guard: ln(0) is undefined
+
+    // 6. BOX-MULLER TRANSFORM
+    // Formula: Z = sqrt(-2 * ln(U1)) * cos(2 * pi * U2)
+    // Hardware Optimization: 
+    //   ln(x) = lg2(x) * 0.693147. Multiplier = -2 * 0.693147 = -1.386294
+    
+    cvt.rn.f32.f64 %f_u1, %fd_u1;
+    lg2.approx.f32 %f_temp, %f_u1;
+    mul.f32 %f_temp, %f_temp, -1.38629436; 
+    sqrt.approx.f32 %f_temp, %f_temp;
+    
+    cvt.rn.f32.f64 %f_u2, %fd_u2;
+    mul.f32 %f_u2, %f_u2, 6.2831853; // 2 * pi
+    cos.approx.f32 %f_z, %f_u2;
+    mul.f32 %f_z, %f_z, %f_temp;     // Z ~ N(0, 1)
+    cvt.f64.f32 %fd_z, %f_z;
+
+    // 7. PRICE TRAJECTORY STEP
+    // Formula: S(t+1) = S(t) * exp( DriftTerm + σ * Z )
+    // Hardware Optimization:
+    //   exp(x) = 2^(x * log2(e)). Multiplier = 1.442695
+    
+    fma.rn.f64 %fd_temp, %fd_vol, %fd_z, %fd_drift_term;
+    mul.f64 %fd_temp, %fd_temp, 1.44269504; 
+    cvt.rn.f32.f64 %f_temp, %fd_temp;
+    ex2.approx.f32 %f_temp, %f_temp;
+    cvt.f64.f32 %fd_temp, %f_temp;
+    mul.f64 %fd_St, %fd_St, %fd_temp;
+
+    // 8. BARRIER HIT LOGIC (Touch Check)
+    // If Short (Target < S0): Trigger if St <= Target
+    // If Long  (Target > S0): Trigger if St >= Target
+    
+    setp.lt.f64 %p_target_below, %fd_target, %fd_S0; 
+    @%p_target_below  setp.le.f64 %p_hit_now, %fd_St, %fd_target; 
+    @!%p_target_below setp.ge.f64 %p_hit_now, %fd_St, %fd_target; 
+    @%p_hit_now mov.u32 %r_hit_flag, 1;
+    
+    // Iterate day count
+    
+    add.u32 %r_day_cnt, %r_day_cnt, 1;
+    setp.lt.u32 %p_path_loop, %r_day_cnt, %r_horizon;
+    @%p_path_loop bra L_PATH_WALK;
+
+    // 9. ACCUMULATE PATH RESULTS
+    
+    add.f64 %fd_sum_acc, %fd_sum_acc, %fd_St;   // Sum of ending prices
+    add.u32 %r_total_hits, %r_total_hits, %r_hit_flag;
+
+    // Iterate simulation count
+    
+    add.u32 %r_sim_cnt, %r_sim_cnt, 1;
+    setp.lt.u32 %p_sim_loop, %r_sim_cnt, %r_iters;
+    @%p_sim_loop bra L_SIM_LOOP;
+
+    // 10. GLOBAL MEMORY WRITE-BACK
+    // Final reduction to VRAM (only happens once per thread)
+    
+    cvt.u64.u32 %rd_off, %r_tid;
+    
+    // Write Sums (Index * 8 bytes for f64)
+    
+    shl.b64 %rd_tmp, %rd_off, 3; 
+    ld.param.u64 %rd_sums_ptr, [out_sums_ptr];
+    add.u64 %rd_sums_ptr, %rd_sums_ptr, %rd_tmp;
+    st.global.f64 [%rd_sums_ptr], %fd_sum_acc;
+
+    // Write Hits (Index * 4 bytes for u32)
+
+    shl.b64 %rd_tmp, %rd_off, 2; 
+    ld.param.u64 %rd_hits_ptr, [out_hits_ptr];
+    add.u64 %rd_hits_ptr, %rd_hits_ptr, %rd_tmp;
+    st.global.u32 [%rd_hits_ptr], %r_total_hits;
+
+    ret;
+}
