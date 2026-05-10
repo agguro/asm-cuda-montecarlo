@@ -65,6 +65,9 @@ PROBABILITY ANALYSIS:
 ## Technical Philosophy (Updated)
 
 **Zero-Footprint**: Orchestration is written directly in GNU as (x86_64). Heavy-lifting parallel math runs in PTX (NVIDIA Assembly). No bloated high-level libraries.
+
 **ABI-Proof & Stack Safe**: Built with strict manual 16-byte stack alignment and adherence to the System V AMD64 ABI for drop-in compatibility.
+
 **Direct Driver Access**: Currently loads .cubin modules via the CUDA Driver API (libcuda).
+
 **Future Roadmap (The "True" Bare-Metal Path)**: This project is moving toward a Zero-Dependency Architecture. Future iterations will bypass libc and libcuda entirely, utilizing pure Linux Syscalls for host logic and direct IOCTL calls to the NVIDIA kernel-mode driver for GPU orchestration, memory mapping, and kernel launching.
