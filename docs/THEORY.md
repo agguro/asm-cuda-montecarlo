@@ -1,4 +1,4 @@
-# THEORY.md
+# THEORY
 
 ## Overview
 
